@@ -129,6 +129,32 @@ class SchedulerConfig:
     the default scheduler. Can be a class directly or the path to a class of
     form "mod.custom_class"."""
 
+    cache_affinity_enabled: bool = True
+    """Enable cache-affinity-aware reordering of the waiting queue.
+
+    Only takes effect when scheduler_cls points to CacheAffinityScheduler.
+    When False, the scheduler subclass is a no-op pass-through to the parent.
+    """
+
+    cache_affinity_max_wait_s: float = 0.2
+    """Anti-starvation deadline for CacheAffinityScheduler. A waiting request
+    that has been waiting longer than this many seconds is promoted to the head
+    of the queue regardless of its cache-affinity score.
+    """
+
+    cache_affinity_min_blocks: int = 2
+    """Minimum cached-block count for a request to be considered cache-warm by
+    CacheAffinityScheduler. Requests with fewer cached blocks score 0 (treated
+    as cache-cold). Avoids reordering thrash from one-block hits.
+    """
+
+    cache_affinity_bucket_edges: tuple[int, ...] = (4, 16, 64, 256)
+    """Score bucket boundaries for CacheAffinityScheduler. Two requests whose
+    raw cached-block counts fall in the same bucket are tied on the cache axis
+    (broken by arrival_time). Reduces sort thrash across iterations when scores
+    drift by small amounts.
+    """
+
     disable_hybrid_kv_cache_manager: bool | None = None
     """If set to True, KV cache manager will allocate the same size of KV cache
     for all attention layers even if there are multiple type of attention layers
