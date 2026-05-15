@@ -6,21 +6,29 @@ All four benchmark scripts (synthetic, RAG, ShareGPT, adversarial) import
 from here. This module provides:
 
 - ``BenchmarkConfig``  — engine + run configuration (dataclass).
-- ``RequestRecord``    — a single (prompt, output_len) pair.
+- ``RequestRecord``    — a single (prompt, output_len) pair with an optional
+  ``arrival_time_offset_s`` for online/QPS-throttled replay.
 - ``BenchmarkResult``  — aggregated latency/throughput metrics.
-- ``replay_trace()``   — drives ``llm.generate()`` in arrival-ordered batches
-  and measures per-request latency.
+- ``replay_trace()``   — offline batch replay (all requests submitted at once).
+- ``replay_trace_online()`` — online step-loop replay honouring per-request
+  arrival times; requires a ``vllm.LLM`` instance.
+- ``assign_poisson_arrivals()`` — compute Poisson inter-arrival offsets and
+  write them onto ``RequestRecord.arrival_time_offset_s``.
 - ``write_result()``   — writes a ``BenchmarkResult`` to JSON.
 - ``load_trace_from_jsonl()`` / ``save_trace_to_jsonl()`` — trace I/O.
 
-The harness is intentionally engine-agnostic: ``replay_trace()`` accepts any
-object with a ``generate(prompts, sampling_params)`` interface so that
+The offline ``replay_trace()`` is intentionally engine-agnostic: it accepts
+any object with a ``generate(prompts, sampling_params)`` interface so that
 ``validate_harness.py`` can inject a mock without loading a real model.
+
+The online ``replay_trace_online()`` requires a real ``vllm.LLM`` instance
+and accesses ``llm.llm_engine`` directly to drive the step loop.
 """
 
 from __future__ import annotations
 
 import json
+import random
 import statistics
 import time
 from dataclasses import asdict, dataclass, field
@@ -61,6 +69,9 @@ class RequestRecord:
     # Metadata preserved across trace serialisation.
     group_id: str = ""
     priority: int = 0
+    # Seconds after benchmark start when this request should arrive.
+    # 0.0 means "submit immediately" (offline / batch mode).
+    arrival_time_offset_s: float = 0.0
 
 
 @dataclass
@@ -84,7 +95,7 @@ class BenchmarkResult:
 
 
 # ---------------------------------------------------------------------------
-# Engine protocol
+# Engine protocol (offline batch mode)
 # ---------------------------------------------------------------------------
 
 
@@ -101,7 +112,30 @@ class EngineProtocol(Protocol):
 
 
 # ---------------------------------------------------------------------------
-# Core replay driver
+# Arrival-time helpers
+# ---------------------------------------------------------------------------
+
+
+def assign_poisson_arrivals(
+    records: list[RequestRecord],
+    *,
+    qps: float,
+    seed: int = 42,
+) -> None:
+    """Assign Poisson inter-arrival offsets to each record in-place.
+
+    After this call, ``record.arrival_time_offset_s`` holds the time (in
+    seconds after benchmark start) at which that request should be submitted.
+    """
+    rng = random.Random(seed)
+    t = 0.0
+    for record in records:
+        record.arrival_time_offset_s = t
+        t += rng.expovariate(qps)
+
+
+# ---------------------------------------------------------------------------
+# Core replay drivers
 # ---------------------------------------------------------------------------
 
 
@@ -114,13 +148,9 @@ def replay_trace(
 ) -> list[float]:
     """Submit ``records`` to ``engine`` and return per-request latencies (s).
 
-    Requests are submitted in the order they appear in ``records`` (which
-    should already be sorted by intended arrival order).  When ``batch_size``
-    is None every record is submitted in a single ``generate()`` call,
-    mirroring how ``benchmark_prefix_caching.py`` operates.  Pass an integer
-    to submit in fixed-size batches (useful when simulating bursty arrivals).
-
-    Returns a flat list of per-request elapsed times in arrival order.
+    Offline / batch mode: all requests submitted simultaneously (arrival times
+    ignored).  Suitable for quick iteration tests and the adversarial / no-QPS
+    benchmarks.  Returns a flat list of per-request elapsed times.
     """
     if not records:
         return []
@@ -139,13 +169,98 @@ def replay_trace(
         t0 = time.perf_counter()
         engine.generate(prompts, sampling_params_list)
         elapsed = time.perf_counter() - t0
-        # Distribute elapsed time equally across the batch.  A per-token TTFT
-        # breakdown would require the async engine; this gives a fair
-        # throughput-level comparison.
         per_req = elapsed / len(batch)
         latencies.extend([per_req] * len(batch))
 
     return latencies
+
+
+def replay_trace_online(
+    records: list[RequestRecord],
+    llm: Any,  # vllm.LLM
+    *,
+    max_new_tokens: int = 64,
+) -> tuple[list[float], float]:
+    """Online step-loop replay honouring ``arrival_time_offset_s``.
+
+    Submits requests to the underlying v1 LLMEngine one by one as their
+    scheduled arrival time approaches, then drives the engine step loop until
+    all requests complete.  This creates a real waiting queue whose depth and
+    composition vary over time — the scenario where cache-affinity reordering
+    provides genuine value.
+
+    Returns ``(per_request_latencies_s, total_wall_time_s)``.  Each latency
+    is measured from the request's target arrival time to its completion.
+    ``total_wall_time_s`` is the actual wall-clock span from benchmark start
+    to the last completion, suitable for throughput calculation.
+    """
+    if not records:
+        return [], 0.0
+
+    engine = llm.llm_engine
+    # Sort by intended arrival time (defensive).
+    records_sorted = sorted(records, key=lambda r: r.arrival_time_offset_s)
+    total = len(records_sorted)
+
+    benchmark_start = time.monotonic()
+    # Map internal (randomised) request_id → position in records_sorted
+    id_to_idx: dict[str, int] = {}
+    # Intended arrival offset per index (used as latency start)
+    submit_offsets: dict[int, float] = {}
+    # Completed latencies keyed by position
+    latencies: dict[int, float] = {}
+    next_idx = 0
+
+    while next_idx < total or engine.has_unfinished_requests():
+        now = time.monotonic() - benchmark_start
+
+        # Submit all requests whose arrival window has opened.
+        while (
+            next_idx < total and records_sorted[next_idx].arrival_time_offset_s <= now
+        ):
+            r = records_sorted[next_idx]
+            sp = SamplingParams(
+                max_tokens=r.output_len or max_new_tokens,
+                temperature=0.0,
+            )
+            # Pass the monotonic arrival_time so the scheduler's wait_s
+            # computation (which uses time.monotonic()) is correct.
+            actual_arrival = benchmark_start + r.arrival_time_offset_s
+            req_id = engine.add_request(
+                f"bench_{next_idx}",
+                r.prompt,
+                sp,
+                arrival_time=actual_arrival,
+            )
+            id_to_idx[req_id] = next_idx
+            submit_offsets[next_idx] = r.arrival_time_offset_s
+            next_idx += 1
+
+        # If the engine has nothing to do and no request has arrived yet,
+        # sleep until just before the next arrival to avoid spinning.
+        if not engine.has_unfinished_requests() and next_idx < total:
+            next_arrival = records_sorted[next_idx].arrival_time_offset_s
+            sleep_s = next_arrival - (time.monotonic() - benchmark_start)
+            if sleep_s > 0.001:
+                time.sleep(sleep_s * 0.9)
+            continue
+
+        step_outputs = engine.step()
+        step_end = time.monotonic() - benchmark_start
+
+        for out in step_outputs:
+            if out.finished and out.request_id in id_to_idx:
+                idx = id_to_idx.pop(out.request_id)
+                latencies[idx] = step_end - submit_offsets[idx]
+
+    total_wall_time_s = time.monotonic() - benchmark_start
+    per_req_latencies = [latencies.get(i, 0.0) for i in range(total)]
+    return per_req_latencies, total_wall_time_s
+
+
+# ---------------------------------------------------------------------------
+# Aggregation
+# ---------------------------------------------------------------------------
 
 
 def aggregate(
@@ -153,7 +268,11 @@ def aggregate(
     scenario: str,
     scheduler_cls: str,
 ) -> BenchmarkResult:
-    """Convert a flat list of latencies into a ``BenchmarkResult``."""
+    """Convert a flat list of offline latencies into a ``BenchmarkResult``.
+
+    In offline mode the sum of per-request latencies equals the wall-clock
+    time, so ``throughput_req_s = n / sum(latencies)``.
+    """
     n = len(latencies)
     if n == 0:
         raise ValueError("Cannot aggregate an empty latency list.")
@@ -174,6 +293,40 @@ def aggregate(
         p99_latency_s=_percentile(sorted_lats, 99),
         total_wall_time_s=total,
         throughput_req_s=n / total if total > 0 else 0.0,
+        latencies_s=latencies,
+    )
+
+
+def aggregate_online(
+    latencies: list[float],
+    total_wall_time_s: float,
+    scenario: str,
+    scheduler_cls: str,
+) -> BenchmarkResult:
+    """Convert online-mode per-request latencies into a ``BenchmarkResult``.
+
+    In online mode per-request latencies overlap (concurrent execution), so
+    the wall-clock time is passed separately and used for throughput.
+    """
+    n = len(latencies)
+    if n == 0:
+        raise ValueError("Cannot aggregate an empty latency list.")
+    sorted_lats = sorted(latencies)
+
+    def _percentile(sorted_list: list[float], p: float) -> float:
+        idx = min(int(len(sorted_list) * p / 100), len(sorted_list) - 1)
+        return sorted_list[idx]
+
+    return BenchmarkResult(
+        scenario=scenario,
+        scheduler_cls=scheduler_cls,
+        num_requests=n,
+        mean_latency_s=statistics.mean(latencies),
+        p50_latency_s=_percentile(sorted_lats, 50),
+        p95_latency_s=_percentile(sorted_lats, 95),
+        p99_latency_s=_percentile(sorted_lats, 99),
+        total_wall_time_s=total_wall_time_s,
+        throughput_req_s=n / total_wall_time_s if total_wall_time_s > 0 else 0.0,
         latencies_s=latencies,
     )
 

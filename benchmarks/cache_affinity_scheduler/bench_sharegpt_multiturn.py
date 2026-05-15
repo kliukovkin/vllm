@@ -10,12 +10,32 @@ conversation share the history of turns 1..N-1.
 The trace is grouped by conversation so that related turns are submitted
 together, maximising the observable cache-affinity benefit.
 
+**Offline mode** (no ``--qps``, default):
+  Both baseline and affinity schedulers are run internally.  All requests are
+  submitted at once (batch mode).  Produces ``sharegpt_baseline.json`` and
+  ``sharegpt_affinity.json`` in ``--output-dir``.
+
+**Online mode** (``--qps N``):
+  A single scheduler run honouring Poisson inter-arrival times.  The
+  scheduler is taken from ``--scheduler-cls`` (or ``engine_args`` default).
+  Produces a single ``result.json`` in ``--output-dir``.
+
 Usage::
 
+    # Offline:
     python -m benchmarks.cache_affinity_scheduler.bench_sharegpt_multiturn \\
         --model facebook/opt-125m \\
         --dataset-path /path/to/ShareGPT_V3_unfiltered_cleaned_split.json \\
         --num-conversations 32
+
+    # Online:
+    python -m benchmarks.cache_affinity_scheduler.bench_sharegpt_multiturn \\
+        --model facebook/opt-125m \\
+        --dataset-path /path/to/ShareGPT_V3_unfiltered_cleaned_split.json \\
+        --num-conversations 32 \\
+        --qps 10 \\
+        --scheduler-cls \
+            vllm.v1.core.sched.cache_affinity_scheduler.CacheAffinityScheduler
 """
 
 from __future__ import annotations
@@ -29,8 +49,11 @@ from benchmarks.cache_affinity_scheduler.harness import (
     BenchmarkResult,
     RequestRecord,
     aggregate,
+    aggregate_online,
+    assign_poisson_arrivals,
     compare_results,
     replay_trace,
+    replay_trace_online,
     save_trace_to_jsonl,
     write_result,
 )
@@ -46,17 +69,11 @@ def _load_sharegpt(
     max_new_tokens: int,
     seed: int,
 ) -> list[RequestRecord]:
-    """Load ShareGPT conversations and build multi-turn prompt records.
-
-    Each turn in a conversation is represented as a ``RequestRecord`` whose
-    prompt is the full conversation history up to that turn.  This naturally
-    creates long shared prefixes between consecutive turns.
-    """
+    """Load ShareGPT conversations and build multi-turn prompt records."""
     with open(path) as f:
         data = json.load(f)
 
     rng = random.Random(seed)
-    # Filter to conversations with at least 2 turns.
     valid = [
         conv
         for conv in data
@@ -75,7 +92,6 @@ def _load_sharegpt(
             text = turn.get("value", "")
             history += f"[{role.upper()}] {text}\n"
             if role in ("gpt", "assistant") and i > 0:
-                # Only submit on assistant turns (the model response turns).
                 records.append(
                     RequestRecord(
                         prompt=history.strip(),
@@ -87,7 +103,7 @@ def _load_sharegpt(
     return records
 
 
-def _run_once(
+def _run_once_offline(
     records: list[RequestRecord],
     engine_args: EngineArgs,
     scheduler_cls: str,
@@ -99,6 +115,25 @@ def _run_once(
     latencies = replay_trace(records, llm, max_new_tokens=max_new_tokens)
     del llm
     return aggregate(latencies, scenario, scheduler_cls)
+
+
+def _run_once_online(
+    records: list[RequestRecord],
+    engine_args: EngineArgs,
+    max_new_tokens: int,
+    scenario: str,
+    qps: float,
+    seed: int,
+) -> BenchmarkResult:
+    assign_poisson_arrivals(records, qps=qps, seed=seed)
+    llm = LLM.from_engine_args(engine_args)
+    latencies, wall_time = replay_trace_online(
+        records, llm, max_new_tokens=max_new_tokens
+    )
+    del llm
+    return aggregate_online(
+        latencies, wall_time, scenario, engine_args.scheduler_cls or ""
+    )
 
 
 def main() -> None:
@@ -120,6 +155,16 @@ def main() -> None:
         "--max-turns", type=int, default=4, help="Max turns per conversation."
     )
     parser.add_argument("--max-new-tokens", type=int, default=64)
+    parser.add_argument(
+        "--qps",
+        type=float,
+        default=None,
+        help=(
+            "Target request rate (req/s) for online Poisson-arrival mode. "
+            "When set, runs a single scheduler with real inter-arrival delays. "
+            "When unset, runs both schedulers in offline batch mode."
+        ),
+    )
     parser.add_argument(
         "--save-trace",
         type=Path,
@@ -149,26 +194,49 @@ def main() -> None:
     if args.save_trace:
         save_trace_to_jsonl(records, args.save_trace)
 
-    affinity_cls = "vllm.v1.core.sched.cache_affinity_scheduler.CacheAffinityScheduler"
-    baseline_cls = "vllm.v1.core.sched.scheduler.Scheduler"
+    if args.qps is not None:
+        # Online single-scheduler mode.
+        sched_name = (engine_args.scheduler_cls or "baseline").split(".")[-1].lower()
+        scenario = f"sharegpt_online_{sched_name}"
+        result = _run_once_online(
+            records,
+            engine_args,
+            args.max_new_tokens,
+            scenario,
+            qps=args.qps,
+            seed=args.seed,
+        )
+        write_result(result, args.output_dir / "result.json")
+        print(
+            f"[sharegpt] qps={args.qps} scheduler={sched_name} "
+            f"mean_lat={result.mean_latency_s:.3f}s "
+            f"p99_lat={result.p99_latency_s:.3f}s "
+            f"throughput={result.throughput_req_s:.3f} req/s"
+        )
+    else:
+        # Offline both-scheduler mode (backward compatibility).
+        affinity_cls = (
+            "vllm.v1.core.sched.cache_affinity_scheduler.CacheAffinityScheduler"
+        )
+        baseline_cls = "vllm.v1.core.sched.scheduler.Scheduler"
 
-    baseline = _run_once(
-        records, engine_args, baseline_cls, args.max_new_tokens, "sharegpt_baseline"
-    )
-    affinity = _run_once(
-        records, engine_args, affinity_cls, args.max_new_tokens, "sharegpt_affinity"
-    )
+        baseline = _run_once_offline(
+            records, engine_args, baseline_cls, args.max_new_tokens, "sharegpt_baseline"
+        )
+        affinity = _run_once_offline(
+            records, engine_args, affinity_cls, args.max_new_tokens, "sharegpt_affinity"
+        )
 
-    write_result(baseline, args.output_dir / "sharegpt_baseline.json")
-    write_result(affinity, args.output_dir / "sharegpt_affinity.json")
+        write_result(baseline, args.output_dir / "sharegpt_baseline.json")
+        write_result(affinity, args.output_dir / "sharegpt_affinity.json")
 
-    cmp = compare_results(baseline, affinity)
-    print(
-        f"[sharegpt] latency improvement: "
-        f"{cmp['latency_improvement_pct']:+.1f}%  "
-        f"throughput improvement: "
-        f"{cmp['throughput_improvement_pct']:+.1f}%"
-    )
+        cmp = compare_results(baseline, affinity)
+        print(
+            f"[sharegpt] latency improvement: "
+            f"{cmp['latency_improvement_pct']:+.1f}%  "
+            f"throughput improvement: "
+            f"{cmp['throughput_improvement_pct']:+.1f}%"
+        )
 
 
 if __name__ == "__main__":
