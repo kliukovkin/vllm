@@ -611,6 +611,9 @@ class EngineArgs:
     enable_mm_processor_stats: bool = ObservabilityConfig.enable_mm_processor_stats
     scheduling_policy: SchedulerPolicy = SchedulerConfig.policy
     scheduler_cls: str | type[object] | None = SchedulerConfig.scheduler_cls
+    cache_affinity_bucket_edges: tuple[int, ...] = (
+        SchedulerConfig.cache_affinity_bucket_edges
+    )
 
     pooler_config: PoolerConfig | None = ModelConfig.pooler_config
     compilation_config: CompilationConfig = get_field(VllmConfig, "compilation_config")
@@ -1969,6 +1972,7 @@ class EngineArgs:
             disable_hybrid_kv_cache_manager=self.disable_hybrid_kv_cache_manager,
             async_scheduling=self.async_scheduling,
             stream_interval=self.stream_interval,
+            cache_affinity_bucket_edges=self.cache_affinity_bucket_edges,
         )
 
         if not model_config.is_multimodal_model and self.default_mm_loras:
