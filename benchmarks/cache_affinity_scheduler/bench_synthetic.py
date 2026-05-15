@@ -42,7 +42,7 @@ from benchmarks.cache_affinity_scheduler.harness import (
 )
 from vllm import LLM
 from vllm.engine.arg_utils import EngineArgs
-from vllm.utils import FlexibleArgumentParser
+from vllm.utils.argparse_utils import FlexibleArgumentParser
 
 _VOCAB_SIZE = 32000  # conservative; actual vocab checked against tokeniser
 
