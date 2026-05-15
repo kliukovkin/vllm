@@ -98,7 +98,6 @@ def main() -> int:
         type=Path,
         default=Path("benchmarks/cache_affinity_scheduler/results"),
     )
-    parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
     engine_args = EngineArgs.from_cli_args(args)

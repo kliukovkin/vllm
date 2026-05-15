@@ -143,7 +143,6 @@ def main() -> None:
         default=Path("benchmarks/cache_affinity_scheduler/results"),
         help="Directory to write JSON result files.",
     )
-    parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
     engine_args = EngineArgs.from_cli_args(args)
