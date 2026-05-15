@@ -84,6 +84,7 @@ def create_cas_scheduler(
     cache_affinity_max_wait_s: float = 0.2,
     cache_affinity_min_blocks: int = 2,
     cache_affinity_bucket_edges: tuple = (4, 16, 64, 256),
+    cache_affinity_batch_guard_threshold_s: float = 0.01,
 ) -> CacheAffinityScheduler:
     """Create a CacheAffinityScheduler under test."""
     model_config = ModelConfig(
@@ -104,6 +105,7 @@ def create_cas_scheduler(
         cache_affinity_max_wait_s=cache_affinity_max_wait_s,
         cache_affinity_min_blocks=cache_affinity_min_blocks,
         cache_affinity_bucket_edges=cache_affinity_bucket_edges,
+        cache_affinity_batch_guard_threshold_s=cache_affinity_batch_guard_threshold_s,
     )
     cache_config = CacheConfig(
         block_size=block_size,
@@ -217,9 +219,11 @@ def test_reorder_promotes_cache_warm():
     to the front after _reorder_waiting()."""
     sched = create_cas_scheduler(cache_affinity_min_blocks=1)
     now = time.monotonic()
-    req_a = make_request("a", arrival_time=now - 0.001)  # earliest, cold
+    # Use arrival times spread > 10 ms (batch-guard threshold) so the guard
+    # does not suppress the reorder.
+    req_a = make_request("a", arrival_time=now - 0.100)  # earliest, cold
     req_b = make_request("b", arrival_time=now - 0.000)  # latest, warm (10 blocks)
-    req_c = make_request("c", arrival_time=now - 0.0005)  # middle, cold
+    req_c = make_request("c", arrival_time=now - 0.050)  # middle, cold
 
     for r in (req_a, req_b, req_c):
         sched.waiting.add_request(r)
@@ -573,4 +577,110 @@ def test_sort_latency_recorded():
     assert last_sample >= 0, "Sort latency must be non-negative"
     assert last_sample < 100_000, (
         f"Sort latency {last_sample} µs exceeds 100 ms — suspiciously slow"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 5.14: batch-arrival guard triggers when spread is below threshold
+# ---------------------------------------------------------------------------
+
+
+def test_batch_guard_triggers_under_threshold():
+    """All requests arriving simultaneously → reorder is skipped."""
+    sched = create_cas_scheduler(
+        cache_affinity_min_blocks=1,
+        cache_affinity_batch_guard_threshold_s=0.01,
+    )
+    now = time.monotonic()
+    # Three requests, all within 5 ms of each other.
+    req_a = make_request("a", arrival_time=now + 0.000)
+    req_b = make_request("b", arrival_time=now + 0.002)
+    req_c = make_request("c", arrival_time=now + 0.004)
+
+    for r in (req_a, req_b, req_c):
+        sched.waiting.add_request(r)
+
+    # b has lots of cached blocks — would normally be promoted, but the guard
+    # should fire and leave the order unchanged.
+    block_size = sched.block_size
+    _mock_get_computed_blocks(sched, {"a": 0, "b": block_size * 64, "c": 0})
+
+    before_guard = sched._stat_batch_guard_triggered_total
+    sched._reorder_waiting()
+
+    assert sched._stat_batch_guard_triggered_total == before_guard + 1, (
+        "Guard counter should increment when spread < threshold"
+    )
+    # Order must be unchanged (guard skipped the sort).
+    order = _drain_sortable(sched)
+    assert order == ["a", "b", "c"], f"Guard should preserve FCFS order; got {order}"
+
+
+# ---------------------------------------------------------------------------
+# Test 5.15: batch-arrival guard is inactive when spread exceeds threshold
+# ---------------------------------------------------------------------------
+
+
+def test_batch_guard_skips_above_threshold():
+    """Requests spread over > threshold → guard inactive, reorder happens."""
+    sched = create_cas_scheduler(
+        cache_affinity_min_blocks=1,
+        cache_affinity_batch_guard_threshold_s=0.01,
+    )
+    now = time.monotonic()
+    # Spread of 200 ms — well above 10 ms threshold.
+    req_a = make_request("a", arrival_time=now + 0.000)
+    req_b = make_request("b", arrival_time=now + 0.100)
+    req_c = make_request("c", arrival_time=now + 0.200)
+
+    for r in (req_a, req_b, req_c):
+        sched.waiting.add_request(r)
+
+    # b has the most cached blocks → should be promoted to front.
+    block_size = sched.block_size
+    _mock_get_computed_blocks(sched, {"a": 0, "b": block_size * 64, "c": 0})
+
+    before_guard = sched._stat_batch_guard_triggered_total
+    sched._reorder_waiting()
+
+    assert sched._stat_batch_guard_triggered_total == before_guard, (
+        "Guard counter must NOT increment when spread >= threshold"
+    )
+    order = _drain_sortable(sched)
+    assert order[0] == "b", f"Cache-warm 'b' must be promoted; got {order}"
+
+
+# ---------------------------------------------------------------------------
+# Test 5.16: batch-arrival guard is disabled when threshold is zero
+# ---------------------------------------------------------------------------
+
+
+def test_batch_guard_threshold_zero_disables():
+    """threshold=0 disables the guard entirely; reorder happens even with
+    identical arrival times."""
+    sched = create_cas_scheduler(
+        cache_affinity_min_blocks=1,
+        cache_affinity_batch_guard_threshold_s=0.0,
+    )
+    now = time.monotonic()
+    # All three requests arrive at exactly the same instant.
+    req_a = make_request("a", arrival_time=now)
+    req_b = make_request("b", arrival_time=now)
+    req_c = make_request("c", arrival_time=now)
+
+    for r in (req_a, req_b, req_c):
+        sched.waiting.add_request(r)
+
+    # b is cache-warm → should be promoted despite zero spread.
+    block_size = sched.block_size
+    _mock_get_computed_blocks(sched, {"a": 0, "b": block_size * 64, "c": 0})
+
+    sched._reorder_waiting()
+
+    assert sched._stat_batch_guard_triggered_total == 0, (
+        "Guard must never trigger when threshold=0"
+    )
+    order = _drain_sortable(sched)
+    assert order[0] == "b", (
+        f"With guard disabled, cache-warm 'b' must still be promoted; got {order}"
     )
