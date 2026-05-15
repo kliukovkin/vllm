@@ -155,6 +155,14 @@ class SchedulerConfig:
     drift by small amounts.
     """
 
+    cache_affinity_batch_guard_threshold_s: float = 0.01
+    """Batch-arrival guard for CacheAffinityScheduler. When all waiting
+    requests' arrival timestamps span less than this many seconds, the
+    cache-affinity reorder is skipped entirely. Avoids pure overhead in
+    offline batch mode and during bursty arrivals where FCFS is already
+    optimal for cache utilization. Set to 0 to disable the guard.
+    """
+
     disable_hybrid_kv_cache_manager: bool | None = None
     """If set to True, KV cache manager will allocate the same size of KV cache
     for all attention layers even if there are multiple type of attention layers

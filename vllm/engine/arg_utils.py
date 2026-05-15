@@ -614,6 +614,9 @@ class EngineArgs:
     cache_affinity_bucket_edges: tuple[int, ...] = (
         SchedulerConfig.cache_affinity_bucket_edges
     )
+    cache_affinity_batch_guard_threshold_s: float = (
+        SchedulerConfig.cache_affinity_batch_guard_threshold_s
+    )
 
     pooler_config: PoolerConfig | None = ModelConfig.pooler_config
     compilation_config: CompilationConfig = get_field(VllmConfig, "compilation_config")
@@ -1973,6 +1976,7 @@ class EngineArgs:
             async_scheduling=self.async_scheduling,
             stream_interval=self.stream_interval,
             cache_affinity_bucket_edges=self.cache_affinity_bucket_edges,
+            cache_affinity_batch_guard_threshold_s=self.cache_affinity_batch_guard_threshold_s,
         )
 
         if not model_config.is_multimodal_model and self.default_mm_loras:

@@ -141,6 +141,9 @@ class CacheAffinityScheduler(Scheduler):
         self.cache_affinity_bucket_edges: tuple[int, ...] = tuple(
             sorted(getattr(cfg, "cache_affinity_bucket_edges", (4, 16, 64, 256)))
         )
+        self.cache_affinity_batch_guard_threshold_s: float = getattr(
+            cfg, "cache_affinity_batch_guard_threshold_s", 0.01
+        )
 
         # Replace self.waiting with our queue, migrating any existing contents.
         # In practice self.waiting will be empty at construction time, but
@@ -160,17 +163,19 @@ class CacheAffinityScheduler(Scheduler):
 
         # Local observable counters (Prometheus wiring is a follow-up task).
         self._stat_thrash_evictions_total: int = 0
+        self._stat_batch_guard_triggered_total: int = 0
         self._stat_sort_us_samples: list[int] = []
         _SORT_SAMPLE_CAP = 1000  # avoid unbounded growth
         self._sort_sample_cap = _SORT_SAMPLE_CAP
 
         logger.info_once(
             "CacheAffinityScheduler enabled. enabled=%s max_wait_s=%s "
-            "min_blocks=%s bucket_edges=%s",
+            "min_blocks=%s bucket_edges=%s batch_guard_threshold_s=%s",
             self.cache_affinity_enabled,
             self.cache_affinity_max_wait_s,
             self.cache_affinity_min_blocks,
             self.cache_affinity_bucket_edges,
+            self.cache_affinity_batch_guard_threshold_s,
         )
 
     # ------------------------------------------------------------------
@@ -196,6 +201,19 @@ class CacheAffinityScheduler(Scheduler):
         requests_to_score = list(self.waiting.iter_sortable())  # type: ignore[attr-defined]
         if len(requests_to_score) <= 1:
             return
+
+        # Batch-arrival guard: if all waiting requests arrived within the
+        # guard threshold, FCFS order is already optimal for cache utilization
+        # (sequential same-prefix requests are already adjacent). Skip the
+        # reorder to avoid pure overhead.
+        if self.cache_affinity_batch_guard_threshold_s > 0:
+            arrival_times = [r.arrival_time for r in requests_to_score]
+            if (
+                max(arrival_times) - min(arrival_times)
+                < self.cache_affinity_batch_guard_threshold_s
+            ):
+                self._stat_batch_guard_triggered_total += 1
+                return
 
         scored: dict[str, int] = {}
         starved: set[str] = set()
