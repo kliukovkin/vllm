@@ -241,38 +241,10 @@ class CacheAffinityScheduler(Scheduler):
                 starved.add(req.request_id)
                 scored[req.request_id] = -1  # sentinel; sort key handles separately
                 continue
-
-            if req.num_computed_tokens > 0:
-                # KVTransfer: request already has some tokens computed.
-                # Use existing count instead of re-querying.
-                num_cached_blocks = req.num_computed_tokens // self.block_size
-            else:
-                try:
-                    blocks_obj, num_cached_tokens = (
-                        self.kv_cache_manager.get_computed_blocks(req)
-                    )
-                except Exception:
-                    # KV manager call should not fail in normal operation.
-                    # If it does, treat as cache-cold and continue — never
-                    # let scoring crash schedule().
-                    scored[req.request_id] = 0
-                    continue
-
-                num_cached_blocks = num_cached_tokens // self.block_size
-
-                # Stash block IDs for the thrash metric (best-effort).
-                try:
-                    block_ids_nested = blocks_obj.get_block_ids(allow_none=True)
-                    if block_ids_nested is not None:
-                        cached_blocks_per_req[req.request_id] = {
-                            bid for group in block_ids_nested for bid in group
-                        }
-                except Exception:
-                    pass  # Thrash tracking is optional; never crash schedule()
-
-            if num_cached_blocks < self.cache_affinity_min_blocks:
-                num_cached_blocks = 0
-            scored[req.request_id] = num_cached_blocks
+            # DIAGNOSTIC: skip get_computed_blocks entirely; assign score=0.
+            # This makes the sort a pure FCFS tiebreak. If ShareGPT latency
+            # returns to stock levels, the KV cache query is the root cause.
+            scored[req.request_id] = 0
 
         self._last_iter_cached_blocks = cached_blocks_per_req
 
