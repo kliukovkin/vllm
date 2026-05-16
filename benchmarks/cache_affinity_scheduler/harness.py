@@ -226,13 +226,13 @@ def replay_trace_online(
             # Pass the monotonic arrival_time so the scheduler's wait_s
             # computation (which uses time.monotonic()) is correct.
             actual_arrival = benchmark_start + r.arrival_time_offset_s
-            req_id = engine.add_request(
+            engine.add_request(
                 f"bench_{next_idx}",
                 r.prompt,
                 sp,
                 arrival_time=actual_arrival,
             )
-            id_to_idx[req_id] = next_idx
+            id_to_idx[f"bench_{next_idx}"] = next_idx
             submit_offsets[next_idx] = r.arrival_time_offset_s
             next_idx += 1
 
