@@ -110,13 +110,24 @@ class CacheAffinityRequestQueue(RequestQueue):
         """Iterate only the sortable portion (excludes sticky-front)."""
         return iter(self._sortable)
 
-    def resort(self, key_fn: Callable[[Request], tuple]) -> None:
-        """Re-sort the sortable deque in-place by ``key_fn`` (lower = better).
+    def resort(self, key_fn: Callable[[Request], tuple], window_k: int = 0) -> None:
+        """Re-sort by ``key_fn`` (lower = better), bounded to the first
+        ``window_k`` positions.
 
-        The sticky-front deque is left untouched so preempted requests
-        remain at the head in their original preemption order.
+        Elements beyond ``window_k`` remain in FCFS order, preventing
+        starvation of requests that arrived early but have low cache scores.
+        If ``window_k`` is 0 or >= len(_sortable), the full deque is sorted.
+        The sticky-front deque is left untouched.
         """
-        self._sortable = deque(sorted(self._sortable, key=key_fn))
+        n = len(self._sortable)
+        if n <= 1:
+            return
+        if window_k <= 0 or window_k >= n:
+            self._sortable = deque(sorted(self._sortable, key=key_fn))
+        else:
+            lst = list(self._sortable)
+            lst[:window_k] = sorted(lst[:window_k], key=key_fn)
+            self._sortable = deque(lst)
 
 
 class CacheAffinityScheduler(Scheduler):
@@ -133,7 +144,7 @@ class CacheAffinityScheduler(Scheduler):
         cfg = self.scheduler_config
         self.cache_affinity_enabled: bool = getattr(cfg, "cache_affinity_enabled", True)
         self.cache_affinity_max_wait_s: float = getattr(
-            cfg, "cache_affinity_max_wait_s", 0.05
+            cfg, "cache_affinity_max_wait_s", 0.2
         )
         self.cache_affinity_min_blocks: int = getattr(
             cfg, "cache_affinity_min_blocks", 2
@@ -143,6 +154,9 @@ class CacheAffinityScheduler(Scheduler):
         )
         self.cache_affinity_batch_guard_threshold_s: float = getattr(
             cfg, "cache_affinity_batch_guard_threshold_s", 0.01
+        )
+        self.cache_affinity_reorder_window_k: int = getattr(
+            cfg, "cache_affinity_reorder_window_k", 8
         )
 
         # Replace self.waiting with our queue, migrating any existing contents.
@@ -170,12 +184,14 @@ class CacheAffinityScheduler(Scheduler):
 
         logger.info_once(
             "CacheAffinityScheduler enabled. enabled=%s max_wait_s=%s "
-            "min_blocks=%s bucket_edges=%s batch_guard_threshold_s=%s",
+            "min_blocks=%s bucket_edges=%s batch_guard_threshold_s=%s "
+            "reorder_window_k=%s",
             self.cache_affinity_enabled,
             self.cache_affinity_max_wait_s,
             self.cache_affinity_min_blocks,
             self.cache_affinity_bucket_edges,
             self.cache_affinity_batch_guard_threshold_s,
+            self.cache_affinity_reorder_window_k,
         )
 
     # ------------------------------------------------------------------
@@ -279,7 +295,7 @@ class CacheAffinityScheduler(Scheduler):
                 # tuple length uniform with the priority branch.
                 return (0, -b, req.arrival_time, req.request_id)
 
-        self.waiting.resort(sort_key)  # type: ignore[attr-defined]
+        self.waiting.resort(sort_key, window_k=self.cache_affinity_reorder_window_k)  # type: ignore[attr-defined]
 
         sort_us = (time.monotonic_ns() - sort_start) // 1000
         self._observe_sort_latency(int(sort_us))
