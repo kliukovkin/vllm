@@ -29,46 +29,50 @@ from collections import deque
 from collections.abc import Callable, Iterator
 
 from vllm.logger import init_logger
-from vllm.v1.core.sched.request_queue import RequestQueue
+from vllm.v1.core.sched.request_queue import FCFSRequestQueue, RequestQueue
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.request import Request
 
 logger = init_logger(__name__)
 
 
-class CacheAffinityRequestQueue(RequestQueue):
-    """Deque-backed waiting queue with per-iteration cache-affinity re-sort.
+class CacheAffinityRequestQueue(FCFSRequestQueue):
+    """FCFSRequestQueue subclass with per-iteration cache-affinity re-sort.
 
-    Maintains two internal collections:
-    - ``_sticky``: requests added via ``prepend_request`` (preempted requests
-      that must remain at the front and are not reordered by cache affinity).
-    - ``_sortable``: requests added via ``add_request`` (the bulk of waiting
-      requests that are candidates for cache-affinity reordering).
+    Extends FCFSRequestQueue (which extends deque) so the main sortable
+    body is a C-level deque — identical runtime cost to FCFS when not
+    reordering.
 
-    ``pop_request`` drains ``_sticky`` first, then ``_sortable``.
-    ``resort`` only sorts ``_sortable``; ``_sticky`` is left untouched.
+    Maintains two collections:
+    - The inherited deque body (``self``): sortable requests added via
+      ``add_request``. Candidates for cache-affinity reordering.
+    - ``_sticky``: requests added via ``prepend_request`` (preempted
+      requests that must remain at the front and are not reordered).
+
+    ``pop_request`` drains ``_sticky`` first, then the deque body.
+    ``resort`` / ``iter_sortable`` operate on the deque body only.
     """
 
     def __init__(self) -> None:
+        super().__init__()  # initialises inherited C-level deque
         self._sticky: deque[Request] = deque()
-        self._sortable: deque[Request] = deque()
 
     # ------------------------------------------------------------------
-    # RequestQueue ABC implementation
+    # RequestQueue ABC overrides
     # ------------------------------------------------------------------
 
     def add_request(self, request: Request) -> None:
-        self._sortable.append(request)
+        self.append(request)  # deque.append — O(1) C-level
 
     def pop_request(self) -> Request:
         if self._sticky:
             return self._sticky.popleft()
-        return self._sortable.popleft()
+        return self.popleft()  # deque.popleft — O(1) C-level
 
     def peek_request(self) -> Request:
         if self._sticky:
             return self._sticky[0]
-        return self._sortable[0]
+        return self[0]  # deque.__getitem__
 
     def prepend_request(self, request: Request) -> None:
         """Add request to the sticky front (preserves preemption order)."""
@@ -84,50 +88,56 @@ class CacheAffinityRequestQueue(RequestQueue):
         try:
             self._sticky.remove(request)
         except ValueError:
-            self._sortable.remove(request)
+            self.remove(request)  # deque.remove
 
     def remove_requests(self, requests: "RequestQueue | list[Request]") -> None:  # type: ignore[override]
         req_set = set(requests)
-        self._sticky = deque(r for r in self._sticky if r not in req_set)
-        self._sortable = deque(r for r in self._sortable if r not in req_set)
+        sticky_kept: list[Request] = [r for r in self._sticky if r not in req_set]
+        self._sticky = deque(sticky_kept)
+        filtered: list[Request] = [
+            r for r in FCFSRequestQueue.__iter__(self) if r not in req_set
+        ]
+        self.clear()
+        self.extend(filtered)
 
     def __bool__(self) -> bool:
-        return bool(self._sticky) or bool(self._sortable)
+        return bool(self._sticky) or deque.__len__(self) > 0
 
     def __len__(self) -> int:
-        return len(self._sticky) + len(self._sortable)
+        return len(self._sticky) + deque.__len__(self)
 
     def __iter__(self) -> Iterator[Request]:
-        """Iterate sticky-front first, then sortable (policy order)."""
+        """Iterate sticky-front first, then sortable body (policy order)."""
         yield from self._sticky
-        yield from self._sortable
+        yield from FCFSRequestQueue.__iter__(self)
 
     # ------------------------------------------------------------------
     # Extension: cache-affinity re-sort
     # ------------------------------------------------------------------
 
     def iter_sortable(self) -> Iterator[Request]:
-        """Iterate only the sortable portion (excludes sticky-front)."""
-        return iter(self._sortable)
+        """Iterate only the sortable deque body (excludes sticky-front)."""
+        return FCFSRequestQueue.__iter__(self)
 
     def resort(self, key_fn: Callable[[Request], tuple], window_k: int = 0) -> None:
-        """Re-sort by ``key_fn`` (lower = better), bounded to the first
-        ``window_k`` positions.
+        """Re-sort the sortable body by ``key_fn`` (lower = better), bounded
+        to the first ``window_k`` positions.
 
         Elements beyond ``window_k`` remain in FCFS order, preventing
         starvation of requests that arrived early but have low cache scores.
-        If ``window_k`` is 0 or >= len(_sortable), the full deque is sorted.
+        If ``window_k`` is 0 or >= body length, the full body is sorted.
         The sticky-front deque is left untouched.
         """
-        n = len(self._sortable)
+        n = deque.__len__(self)
         if n <= 1:
             return
+        lst: list[Request] = list(FCFSRequestQueue.__iter__(self))
         if window_k <= 0 or window_k >= n:
-            self._sortable = deque(sorted(self._sortable, key=key_fn))
+            lst = sorted(lst, key=key_fn)
         else:
-            lst = list(self._sortable)
             lst[:window_k] = sorted(lst[:window_k], key=key_fn)
-            self._sortable = deque(lst)
+        self.clear()
+        self.extend(lst)
 
 
 class CacheAffinityScheduler(Scheduler):
@@ -142,9 +152,7 @@ class CacheAffinityScheduler(Scheduler):
         super().__init__(*args, **kwargs)
 
         cfg = self.scheduler_config
-        self.cache_affinity_enabled: bool = getattr(
-            cfg, "cache_affinity_enabled", False
-        )
+        self.cache_affinity_enabled: bool = getattr(cfg, "cache_affinity_enabled", True)
         self.cache_affinity_max_wait_s: float = getattr(
             cfg, "cache_affinity_max_wait_s", 0.2
         )
@@ -243,10 +251,18 @@ class CacheAffinityScheduler(Scheduler):
                 starved.add(req.request_id)
                 scored[req.request_id] = -1  # sentinel; sort key handles separately
                 continue
-            # DIAGNOSTIC: skip get_computed_blocks entirely; assign score=0.
-            # This makes the sort a pure FCFS tiebreak. If ShareGPT latency
-            # returns to stock levels, the KV cache query is the root cause.
-            scored[req.request_id] = 0
+            try:
+                computed_blocks, _num_computed_tokens = (
+                    self.kv_cache_manager.get_computed_blocks(req)
+                )
+                block_id_groups = computed_blocks.get_block_ids()
+                block_ids = block_id_groups[0] if block_id_groups else []
+                n_cached = len(block_ids)
+                if n_cached >= self.cache_affinity_min_blocks:
+                    cached_blocks_per_req[req.request_id] = set(block_ids)
+            except Exception:
+                n_cached = 0
+            scored[req.request_id] = n_cached
 
         self._last_iter_cached_blocks = cached_blocks_per_req
 
