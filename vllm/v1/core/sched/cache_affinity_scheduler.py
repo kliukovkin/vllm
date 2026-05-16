@@ -133,7 +133,7 @@ class CacheAffinityScheduler(Scheduler):
         cfg = self.scheduler_config
         self.cache_affinity_enabled: bool = getattr(cfg, "cache_affinity_enabled", True)
         self.cache_affinity_max_wait_s: float = getattr(
-            cfg, "cache_affinity_max_wait_s", 0.2
+            cfg, "cache_affinity_max_wait_s", 0.05
         )
         self.cache_affinity_min_blocks: int = getattr(
             cfg, "cache_affinity_min_blocks", 2
