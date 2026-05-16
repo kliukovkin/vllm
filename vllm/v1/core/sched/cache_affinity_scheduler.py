@@ -170,7 +170,7 @@ class CacheAffinityScheduler(AsyncScheduler):
             cfg, "cache_affinity_batch_guard_threshold_s", 0.01
         )
         self.cache_affinity_reorder_window_k: int = getattr(
-            cfg, "cache_affinity_reorder_window_k", 0
+            cfg, "cache_affinity_reorder_window_k", 32
         )
 
         # Replace self.waiting with our queue, migrating any existing contents.
@@ -228,9 +228,15 @@ class CacheAffinityScheduler(AsyncScheduler):
         sort_start = time.monotonic_ns()
         now = time.monotonic()
 
-        requests_to_score = list(self.waiting.iter_sortable())  # type: ignore[attr-defined]
-        if len(requests_to_score) <= 1:
+        window_k = self.cache_affinity_reorder_window_k
+        all_sortable: list[Request] = list(self.waiting.iter_sortable())  # type: ignore[attr-defined]
+        n_sortable = len(all_sortable)
+        if n_sortable <= 1:
             return
+        if window_k > 0 and n_sortable > window_k:
+            requests_to_score = all_sortable[:window_k]
+        else:
+            requests_to_score = all_sortable
 
         # Batch-arrival guard: if all waiting requests arrived within the
         # guard threshold, FCFS order is already optimal for cache utilization
@@ -277,7 +283,7 @@ class CacheAffinityScheduler(AsyncScheduler):
             if req.request_id in starved:
                 # Absolute front: sorts before any valid priority (>=0) or
                 # FCFS leading-zero key.
-                return (-1, 0, 0.0, req.request_id)
+                return (-1, 0, req.arrival_time, req.request_id)
             b = bucketed[req.request_id]
             if policy == "priority":
                 # Primary: priority (lower = higher priority).
