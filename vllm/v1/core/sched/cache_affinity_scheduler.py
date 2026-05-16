@@ -170,7 +170,7 @@ class CacheAffinityScheduler(AsyncScheduler):
             cfg, "cache_affinity_batch_guard_threshold_s", 0.01
         )
         self.cache_affinity_reorder_window_k: int = getattr(
-            cfg, "cache_affinity_reorder_window_k", 8
+            cfg, "cache_affinity_reorder_window_k", 0
         )
 
         # Replace self.waiting with our queue, migrating any existing contents.
