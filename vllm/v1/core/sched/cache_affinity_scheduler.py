@@ -29,8 +29,8 @@ from collections import deque
 from collections.abc import Callable, Iterator
 
 from vllm.logger import init_logger
+from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.request_queue import FCFSRequestQueue, RequestQueue
-from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.request import Request
 
 logger = init_logger(__name__)
@@ -140,12 +140,16 @@ class CacheAffinityRequestQueue(FCFSRequestQueue):
         self.extend(lst)
 
 
-class CacheAffinityScheduler(Scheduler):
-    """Scheduler subclass that reorders the waiting queue by cached-prefix
+class CacheAffinityScheduler(AsyncScheduler):
+    """AsyncScheduler subclass that reorders the waiting queue by cached-prefix
     length before each scheduling iteration.
 
-    Inherits all scheduling logic from ``Scheduler``; only the waiting-queue
-    ordering is changed.
+    Extends AsyncScheduler (not the synchronous Scheduler) so that the engine
+    runs with the async batch-queue pipeline, matching the behaviour of the
+    default scheduler selected when no ``--scheduler-cls`` is given.
+
+    Inherits all scheduling logic from ``AsyncScheduler``/``Scheduler``; only
+    the waiting-queue ordering is changed.
     """
 
     def __init__(self, *args, **kwargs) -> None:  # type: ignore[override]
